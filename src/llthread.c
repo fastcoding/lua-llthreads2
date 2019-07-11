@@ -27,6 +27,8 @@
 #include "traceback.inc"
 #include "copy.inc"
 
+#include "llt_ext.h"
+
 /*export*/
 #ifdef _WIN32
 #  define LLTHREADS_EXPORT_API __declspec(dllexport)
@@ -70,8 +72,6 @@ typedef pthread_t os_thread_t;
 
 #define ERROR_LEN 1024
 
-#define flags_t unsigned char
-
 #define FLAG_NONE      (flags_t)0
 #define FLAG_STARTED   (flags_t)1<<0
 #define FLAG_DETACHED  (flags_t)1<<1
@@ -110,11 +110,7 @@ static const char *LLTHREAD_TAG = LLTHREAD_NAME;
 static const char *LLTHREAD_LOGGER_HOLDER = LLTHREAD_NAME " logger holder";
 static const char* LLTHREAD_INTERRUPTED_ERROR = LLTHREAD_MODULE_NAME_STRING ": thread was interrupted";
 
-typedef struct llthread_child_t {
-  lua_State  *L;
-  int        status;
-  flags_t    flags;
-} llthread_child_t;
+
 
 typedef struct llthread_t {
   llthread_child_t *child;
@@ -132,7 +128,7 @@ static int fail(lua_State *L, const char *msg){
 void llthread_log(lua_State *L, const char *hdr, const char *msg){
   int top = lua_gettop(L);
   lua_rawgetp(L, LUA_REGISTRYINDEX, LLTHREAD_LOGGER_HOLDER);
-  if (!msg) 
+  if (!msg)
     msg = "(no error message)";
   if(lua_isnil(L, -1)){
     lua_pop(L, 1);
@@ -149,6 +145,40 @@ void llthread_log(lua_State *L, const char *hdr, const char *msg){
   lua_settop(L, top);
 }
 //}
+
+#ifdef USE_PTHREAD
+pthread_key_t key2child;
+#endif
+
+static int setup_threadlocal()
+{
+#ifdef USE_PTHREAD
+  return pthread_key_create(&key2child,NULL);
+#else
+  return -1;
+#endif
+}
+
+static void put_childthis(llthread_child_t* child)
+{
+#ifdef USE_PTHREAD
+  pthread_setspecific(key2child,child);
+#endif
+}
+
+static llthread_child_t* get_childthis()
+{
+  #ifdef USE_PTHREAD
+    return (llthread_child_t*)pthread_getspecific(key2child);
+  #endif
+}
+
+static void cleanup_childthis()
+{
+  #ifdef USE_PTHREAD
+  pthread_key_delete(key2child);
+  #endif
+}
 
 //{ llthread_child
 
@@ -196,7 +226,8 @@ static void open_thread_libs(lua_State *L){
 #endif
 
   lua_settop(L, top);
-
+  //init thread local
+  setup_threadlocal();
 #undef L_REGLIB
 }
 
@@ -221,11 +252,12 @@ static void llthread_child_destroy(llthread_child_t *this) {
 
 static OS_THREAD_RETURN llthread_child_thread_run(void *arg) {
   llthread_child_t *this = (llthread_child_t *)arg;
+  CLEANUP_PROC cleanup_proc=NULL;
   lua_State *L = this->L;
   int nargs = lua_gettop(L) - 1;
-
   /* push traceback function as first value on stack. */
-  lua_pushcfunction(this->L, traceback); 
+  put_childthis(this);
+  lua_pushcfunction(this->L, traceback);
   lua_insert(L, 1);
 
   this->status = lua_pcall(L, nargs, LUA_MULTRET, 1);
@@ -235,10 +267,19 @@ static OS_THREAD_RETURN llthread_child_thread_run(void *arg) {
     llthread_log(L, "Error from thread: ", lua_tostring(L, -1));
   }
 
+  cleanup_proc=this->cleanup;
+
   if(IS(this, DETACHED) || !IS(this, JOINABLE)) {
     /* thread is detached, so it must clean-up the child state. */
     llthread_child_destroy(this);
     this = NULL;
+  }
+
+  if (cleanup_proc){
+    cleanup_proc();
+    if (this){
+      this->cleanup=NULL;
+    }
   }
 
 #ifndef USE_PTHREAD
@@ -260,7 +301,7 @@ static OS_THREAD_RETURN llthread_child_thread_run(void *arg) {
 //{ llthread
 
 static void llthread_validate(llthread_t *this){
-  /* describe valid state of llthread_t object 
+  /* describe valid state of llthread_t object
    * from after create and before destroy
    */
   if(!IS(this, STARTED)){
@@ -332,12 +373,13 @@ static void llthread_destroy(llthread_t *this) {
          */
       }
     }
+
     if(IS(this, JOINABLE)){
       llthread_cleanup_child(this);
     }
 
   }while(0);
-
+  cleanup_childthis();
   FREE_STRUCT(this);
 }
 
@@ -447,7 +489,7 @@ static int llthread_join(llthread_t *this, join_timeout_t timeout) {
       return JOIN_ETIMEDOUT;
     }
 
-    if(rc != ESRCH){ 
+    if(rc != ESRCH){
       /*@fixme what else it can be ?*/
       return rc;
     }
@@ -490,7 +532,7 @@ static int llthread_alive(llthread_t *this) {
     return JOIN_ETIMEDOUT;
   }
 
-  if(rc != ESRCH){ 
+  if(rc != ESRCH){
     /*@fixme what else it can be ?*/
     return rc;
   }
@@ -602,7 +644,7 @@ static int l_llthread_join(lua_State *L) {
       lua_pushnumber(L, 0);
       return 2;
     }
-    
+
     /* copy values from child lua state */
     if(child->status != 0) {
       const char *err_msg = lua_tostring(child->L, -1);
@@ -622,7 +664,7 @@ static int l_llthread_join(lua_State *L) {
 
   if( rc == JOIN_ETIMEDOUT ){
     return fail(L, "timeout");
-  } 
+  }
 
   {
     char buf[ERROR_LEN];
@@ -807,6 +849,6 @@ LLTHREADS_EXPORT_API int LLTHREAD_OPEN_NAME(lua_State *L) {
   lua_pushliteral(L, "interrupted_error");
   lua_pushstring(L, LLTHREAD_INTERRUPTED_ERROR);
   lua_rawset(L, -3);
-  
+
   return 1;
 }
